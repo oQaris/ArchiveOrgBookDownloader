@@ -240,7 +240,7 @@ if __name__ == "__main__":
     # 2) eyebrow0000cosi (бронь на 14 дней)
     # 3) bwb_S0-ATJ-863 (бесплатная)
     # Ссылка вида - https://archive.org/details/eyebrow0000cosi
-    id_ = "pasta0000unse_m6m5"
+    id_ = input("ID книги: ")
 
     create_pdf_from_images(lambda: download_images(id_, cook_), f"{id_}.pdf")
     # create_pdf_from_images(lambda: folder_image_supplier('pasta0000unse_m6m5'), "files_pasta.pdf")
