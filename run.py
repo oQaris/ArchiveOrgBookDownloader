@@ -124,24 +124,28 @@ def parse_image_urls(metadata: dict) -> list[str]:
 
 
 def download_images(book_id: str, cookies: dict[str, str]) -> Iterator[ImageFile]:
-    print("Бронируем книгу...")
-    borrow_book(cookies, book_id)
-
     print("Получаем метаданные книги...")
     metadata = get_book_metadata(book_id, cookies)
+
     image_urls = parse_image_urls(metadata)
     total_pages = len(image_urls)
     print(f"Найдено страниц: {total_pages}")
+
+    download_urls = metadata['data']['data']['downloadUrls']
+    if download_urls:
+        print("Эту книгу можно скачать бесплатно по ссылкам:")
+        for url in download_urls:
+            print(url[0] + ": https:" + url[1])
+        return
+
+    print("Бронируем книгу...")
+    borrow_book(cookies, book_id)
 
     print("Обновляем токен...")
     cookies = update_token(cookies, book_id)
 
     progress_bar = tqdm(total=total_pages, desc="Скачивание книги", unit="page")
     for idx, image_url in enumerate(image_urls, 1):
-        progress_bar.set_postfix(page=idx)
-
-        if idx ==4:
-            raise ValueError("asdfasdf")
 
         response = requests.get(image_url, headers=headers(book_id), cookies=cookies)
         if not response.ok:
@@ -204,7 +208,7 @@ def create_pdf_from_images(image_supplier: Callable[[], Iterable[ImageFile]], ou
             if img.mode != "RGB":
                 img = img.convert("RGB")
             images.append(img)
-    except Exception as e:
+    except BaseException as e:
         print(f"Ошибка при получении изображений: {e}")
         error_occurred = True
 
@@ -231,9 +235,12 @@ if __name__ == "__main__":
     print("Подключение к archive.org...")
     cook_ = login(user_, pass_)
 
-    # Пример - pasta0000unse_m6m5 или eyebrow0000cosi
-    # Ссылка - https://archive.org/details/eyebrow0000cosi
-    id_ = input("ID книги: ")
+    # Примеры:
+    # 1) pasta0000unse_m6m5 (бронь на час)
+    # 2) eyebrow0000cosi (бронь на 14 дней)
+    # 3) bwb_S0-ATJ-863 (бесплатная)
+    # Ссылка вида - https://archive.org/details/eyebrow0000cosi
+    id_ = "pasta0000unse_m6m5"
 
     create_pdf_from_images(lambda: download_images(id_, cook_), f"{id_}.pdf")
     # create_pdf_from_images(lambda: folder_image_supplier('pasta0000unse_m6m5'), "files_pasta.pdf")
