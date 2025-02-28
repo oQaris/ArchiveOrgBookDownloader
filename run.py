@@ -1,11 +1,14 @@
+import getpass
 import os
 import re
+import sys
 from io import BytesIO
 from typing import Iterable, Callable, Iterator
 
 import requests
 from PIL import Image
 from PIL.ImageFile import ImageFile
+from PyPDF2 import PdfWriter, PdfReader
 from requests import HTTPError
 from tqdm import tqdm
 
@@ -22,7 +25,7 @@ headers = lambda book_id: {
 }
 
 
-def borrow_book(cookies: dict[str, str], book_id: str):
+def borrow_book(book_id: str, cookies: dict[str, str]):
     # Используем формат multipart/form-data через параметр files
     files = {
         "action": (None, "browse_book"),
@@ -40,7 +43,16 @@ def borrow_book(cookies: dict[str, str], book_id: str):
         raise RuntimeError(f"Ошибка при бронировании книги: {response.content}")
 
 
-def update_token(cookies: dict[str, str], book_id: str) -> dict[str, str]:
+def return_book(book_id: str, cookies: dict[str, str]):
+    files = {
+        "action": (None, "return_loan"),
+        "identifier": (None, book_id)
+    }
+    response = requests.post(loan_service, files=files, headers=headers(book_id), cookies=cookies)
+    response.raise_for_status()
+
+
+def update_token(book_id: str, cookies: dict[str, str], ) -> dict[str, str]:
     files = {
         "action": (None, "create_token"),
         "identifier": (None, book_id)
@@ -74,6 +86,7 @@ def login(username: str, password: str) -> dict[str, str]:
 
     url = f"https://archive.org/account/login"
     response = requests.post(url, files=files, headers=headers("book_id"), cookies=cookies) # book_id - заглушка
+    response.raise_for_status()
 
     # Получаем и устанавливаем из заголовка ответа set-cookie: logged-in-sig, logged-in-user
     cookies.update(response.cookies.get_dict())
@@ -127,10 +140,6 @@ def download_images(book_id: str, cookies: dict[str, str]) -> Iterator[ImageFile
     print("Получаем метаданные книги...")
     metadata = get_book_metadata(book_id, cookies)
 
-    image_urls = parse_image_urls(metadata)
-    total_pages = len(image_urls)
-    print(f"Найдено страниц: {total_pages}")
-
     download_urls = metadata['data']['data']['downloadUrls']
     if download_urls:
         print("Эту книгу можно скачать бесплатно по ссылкам:")
@@ -139,10 +148,17 @@ def download_images(book_id: str, cookies: dict[str, str]) -> Iterator[ImageFile
         return
 
     print("Бронируем книгу...")
-    borrow_book(cookies, book_id)
+    borrow_book(book_id, cookies)
 
     print("Обновляем токен...")
-    cookies = update_token(cookies, book_id)
+    cookies = update_token(book_id, cookies)
+
+    print("Извлекаем страницы...")
+    # Необходимо обновить метаданные после бронирования книги
+    metadata = get_book_metadata(book_id, cookies)
+    image_urls = parse_image_urls(metadata)
+    total_pages = len(image_urls)
+    print(f"Найдено страниц: {total_pages}")
 
     progress_bar = tqdm(total=total_pages, desc="Скачивание книги", unit="page")
     for idx, image_url in enumerate(image_urls, 1):
@@ -151,12 +167,12 @@ def download_images(book_id: str, cookies: dict[str, str]) -> Iterator[ImageFile
         if not response.ok:
             print(f"\nОшибка загрузки страницы {idx}, пытаемся обновить токен...")
             try:
-                cookies = update_token(cookies, book_id)
+                cookies = update_token(book_id, cookies)
             except HTTPError as e:
                 if e.response.json()['error'] == 'You do not currently have this book borrowed.':
-                    print(f"\nИстекло время бронирования книги, бронируем повторно...")
-                    borrow_book(cookies, book_id)
-                    cookies = update_token(cookies, book_id)
+                    print(f"Истекло время бронирования книги, бронируем повторно...")
+                    borrow_book(book_id, cookies)
+                    cookies = update_token(book_id, cookies)
             response = requests.get(image_url, headers=headers(book_id), cookies=cookies)
             response.raise_for_status()
 
@@ -166,6 +182,9 @@ def download_images(book_id: str, cookies: dict[str, str]) -> Iterator[ImageFile
 
     progress_bar.close()
     print("Все страницы успешно загружены!")
+
+    print("Возвращаем книгу...")
+    return_book(book_id, cookies)
 
 
 def folder_image_supplier(folder_path: str, extensions=(".jpg", ".jpeg", ".png")) -> Iterator[ImageFile]:
@@ -189,48 +208,47 @@ def folder_image_supplier(folder_path: str, extensions=(".jpg", ".jpeg", ".png")
         img = Image.open(full_path)
         yield img
 
-
 def create_pdf_from_images(image_supplier: Callable[[], Iterable[ImageFile]], output_pdf):
     """
     Формирует и сохраняет PDF из изображений, полученных от поставщика.
-    Если во время получения изображений произошла ошибка, итоговый файл будет иметь префикс 'partial_'.
+    Промежуточный результат сохраняется в partial_<output_pdf>,
+    а по окончании успешного выполнения файл переименовывается в <output_pdf>.
 
     Аргументы:
         image_supplier: генератор или функция, возвращающая объекты PIL.Image.
         output_pdf: строка, имя итогового PDF-файла.
     """
-    images = []
-    error_occurred = False
-    try:
-        for img in image_supplier():
-            if not isinstance(img, Image.Image):
-                continue
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            images.append(img)
-    except BaseException as e:
-        print(f"Ошибка при получении изображений: {e}")
-        error_occurred = True
+    temp_pdf = "partial_" + output_pdf
+    writer = PdfWriter()
 
-    if not images:
-        print("Не найдено ни одного изображения для формирования PDF.")
-        return
+    for img in image_supplier():
+        if not isinstance(img, Image.Image):
+            continue
+        if img.mode != "RGB":
+            img = img.convert("RGB")
 
-    # Если ошибка произошла во время получения изображений, добавляем префикс
-    final_pdf = ("partial_" + output_pdf) if error_occurred else output_pdf
+        buffer = BytesIO()
+        img.save(buffer, format="PDF")
+        buffer.seek(0)
+        reader = PdfReader(buffer)
 
-    images[0].save(
-        final_pdf,
-        "PDF",
-        save_all=True,
-        append_images=images[1:]
-    )
-    print(f"PDF успешно сохранён: {final_pdf}")
+        # Добавляем страницу (из временного PDF, полученного из одного изображения)
+        writer.add_page(reader.pages[0])
+
+        with open(temp_pdf, "wb") as f:
+            writer.write(f)
+
+    os.replace(temp_pdf, output_pdf)
+    print(f"PDF успешно сохранён: {output_pdf}")
 
 
-if __name__ == "__main__":
+def main():
     user_ = input("Логин (почта): ")
-    pass_ = input("Пароль: ")
+
+    if sys.stdin.isatty():
+        pass_ = getpass.getpass("Пароль: ")
+    else:
+        pass_ = input("Пароль: ")
 
     print("Подключение к archive.org...")
     cook_ = login(user_, pass_)
@@ -244,3 +262,7 @@ if __name__ == "__main__":
 
     create_pdf_from_images(lambda: download_images(id_, cook_), f"{id_}.pdf")
     # create_pdf_from_images(lambda: folder_image_supplier('pasta0000unse_m6m5'), "files_pasta.pdf")
+
+
+if __name__ == "__main__":
+    main()
