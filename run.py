@@ -1,11 +1,13 @@
-import getpass
+import base64
+import hashlib
 import os
 import re
-import sys
 from io import BytesIO
 from typing import Iterable, Callable, Iterator
 
 import requests
+from Crypto.Cipher import AES
+from Crypto.Util import Counter
 from PIL import Image
 from PIL.ImageFile import ImageFile
 from PyPDF2 import PdfWriter, PdfReader
@@ -176,7 +178,13 @@ def download_images(book_id: str, cookies: dict[str, str]) -> Iterator[ImageFile
             response = requests.get(image_url, headers=headers(book_id), cookies=cookies)
             response.raise_for_status()
 
-        img = Image.open(BytesIO(response.content))
+        obf_header = response.headers.get("X-Obfuscate")
+        if obf_header:
+            image_content = deobfuscate_image(response.content, image_url, obf_header)
+        else:
+            image_content = response.content
+
+        img = Image.open(BytesIO(image_content))
         progress_bar.update(1)
         yield img
 
@@ -185,6 +193,47 @@ def download_images(book_id: str, cookies: dict[str, str]) -> Iterator[ImageFile
 
     print("Возвращаем книгу...")
     return_book(book_id, cookies)
+
+
+def deobfuscate_image(image_data, link, obf_header):
+    """
+    @Author: https://github.com/justimm
+    Decrypts the first 1024 bytes of image_data using AES-CTR.
+    The obfuscation_header is expected in the form "1|<base64encoded_counter>"
+    where the base64-decoded counter is 16 bytes.
+    We derive the AES key by taking the SHA-1 digest of the image URL (with protocol/host removed)
+    and using the first 16 bytes.
+    For AES-CTR, we use a 16-byte counter block. The first 8 bytes are used as a fixed prefix,
+    and the remaining 8 bytes (interpreted as a big-endian integer) are used as the initial counter value.
+    """
+    try:
+        version, counter_b64 = obf_header.split('|')
+    except Exception as e:
+        raise ValueError("Invalid X-Obfuscate header format") from e
+
+    if version != '1':
+        raise ValueError("Unsupported obfuscation version: " + version)
+
+    # Derive AES key: replace protocol/host in link with '/'
+    aes_key = re.sub(r"^https?://.*?/", "/", link)
+    sha1_digest = hashlib.sha1(aes_key.encode('utf-8')).digest()
+    key = sha1_digest[:16]
+
+    # Decode the counter (should be 16 bytes)
+    counter_bytes = base64.b64decode(counter_b64)
+    if len(counter_bytes) != 16:
+        raise ValueError(f"Expected counter to be 16 bytes, got {len(counter_bytes)}")
+
+    prefix = counter_bytes[:8]
+    initial_value = int.from_bytes(counter_bytes[8:], byteorder='big')
+
+    # Create AES-CTR cipher with a 64-bit counter length.
+    ctr = Counter.new(64, prefix=prefix, initial_value=initial_value, little_endian=False)
+    cipher = AES.new(key, AES.MODE_CTR, counter=ctr)
+
+    decrypted_part = cipher.decrypt(image_data[:1024])
+    new_data = decrypted_part + image_data[1024:]
+    return new_data
 
 
 def folder_image_supplier(folder_path: str, extensions=(".jpg", ".jpeg", ".png")) -> Iterator[ImageFile]:
@@ -244,11 +293,7 @@ def create_pdf_from_images(image_supplier: Callable[[], Iterable[ImageFile]], ou
 
 def main():
     user_ = input("Логин (почта): ")
-
-    if sys.stdin.isatty():
-        pass_ = getpass.getpass("Пароль: ")
-    else:
-        pass_ = input("Пароль: ")
+    pass_ = input("Пароль: ")
 
     print("Подключение к archive.org...")
     cook_ = login(user_, pass_)
